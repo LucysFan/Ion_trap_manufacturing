@@ -1,0 +1,1 @@
+"""Tests for trap_design."""

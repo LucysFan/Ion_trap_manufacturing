@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trap-design"
+version = "0.1.0"
+description = "Robust design and control of planar Paul-trap X-junctions"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+
+dependencies = [
+    "numpy==1.26.4",
+    "scipy>=1.11,<1.16",
+    "matplotlib>=3.8,<3.11",
+    "tqdm>=4.66,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.6,<1",
+]
+optimization = [
+    "pymoo>=0.6,<1",
+]
+transport = [
+    "torch>=2.3,<3",
+]
+gds = [
+    "gdstk>=0.9,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "config",
+    "config.*",
+    "core",
+    "core.*",
+    "integrations",
+    "integrations.*",
+]
+exclude = [
+    "tests",
+    "tests.*",
+    "workflows",
+    "workflows.*",
+]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

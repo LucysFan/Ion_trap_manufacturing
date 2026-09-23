@@ -1,0 +1,1 @@
+"""Core physics, geometry, optimisation, and transport modules."""

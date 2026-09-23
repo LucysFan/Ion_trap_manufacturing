@@ -1,0 +1,1 @@
+"""Plotting helpers for geometry, fields, paths, and optimisation results."""

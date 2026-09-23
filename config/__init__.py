@@ -1,0 +1,1 @@
+"""Project-wide configuration for planar ion-trap design."""
