@@ -4,24 +4,16 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from scipy.interpolate import CubicSpline
 
-from core.optimization.genome import (
-    FEATURE_CIRCLE,
-    FEATURE_NONE,
-    FEATURE_RECTANGLE,
-    Genome,
-    TOPOLOGY_CENTRAL_RF_CROSS,
-    TOPOLOGY_CENTRAL_RF_DISK,
-    TOPOLOGY_CENTRAL_RF_RING,
-    TOPOLOGY_GROUNDED_MOAT,
-)
+from core.geometry.rf_mask import build_masks
+from core.optimization.genome import Genome
 
 try:
     from config.targets import RF_ANGULAR_FREQUENCY_RAD_S as OMEGA_RF
     from config.targets import TARGET_ION_HEIGHT_M as TARGET_HEIGHT_M
 except ImportError:
     from config.physical_constants import RF_FREQ_NOMINAL_HZ, TARGET_HEIGHT_M
+
     OMEGA_RF = 2.0 * np.pi * RF_FREQ_NOMINAL_HZ
 
 try:
@@ -48,7 +40,13 @@ class EvaluatorConfig:
 
     min_rf_width_m: float = 18e-6
     min_feature_m: float = 6e-6
-    gpu_candidate_chunk: int = 12
+    gpu_candidate_chunk: int = 64
+
+    max_height_peak_m: float = 3e-6
+    max_lateral_peak_m: float = 25e-6
+    max_field_residual_v_m: float = 5e3
+    min_frequency_hz: float = 0.15e6
+    max_anisotropy: float = 3.0
 
 
 @dataclass
@@ -84,131 +82,6 @@ class JunctionMetrics:
     manufacturability_penalty: float
     geometry_penalty: float
 
-def _spline_boundary(values_m: np.ndarray, s: np.ndarray) -> np.ndarray:
-    knots = np.linspace(0.0, 1.0, len(values_m))
-    spline = CubicSpline(knots, values_m, bc_type="natural")
-    return spline(np.clip(s, 0.0, 1.0))
-
-
-def _rectangle_mask(
-    x: np.ndarray,
-    y: np.ndarray,
-    cx: float,
-    cy: float,
-    width: float,
-    height: float,
-    angle: float,
-) -> np.ndarray:
-    cosine = np.cos(angle)
-    sine = np.sin(angle)
-    dx = x - cx
-    dy = y - cy
-    xr = cosine * dx + sine * dy
-    yr = -sine * dx + cosine * dy
-    return (np.abs(xr) <= width / 2.0) & (np.abs(yr) <= height / 2.0)
-
-
-def _apply_c4v_feature(
-    mask: np.ndarray,
-    x: np.ndarray,
-    y: np.ndarray,
-    genome: Genome,
-    feature_index: int,
-) -> None:
-    kind = int(genome.feature_kind[feature_index])
-    if kind == FEATURE_NONE:
-        return
-
-    operation = int(genome.feature_operation[feature_index])
-    radius = float(genome.feature_radius_m[feature_index])
-    theta0 = float(genome.feature_theta_rad[feature_index])
-    p1 = float(genome.feature_p1_m[feature_index])
-    p2 = float(genome.feature_p2_m[feature_index])
-    angle0 = float(genome.feature_angle_rad[feature_index])
-
-    feature_mask = np.zeros_like(mask, dtype=bool)
-
-    for reflection in (-1.0, 1.0):
-        for quarter_turn in range(4):
-            theta = reflection * theta0 + quarter_turn * np.pi / 2.0
-            cx = radius * np.cos(theta)
-            cy = radius * np.sin(theta)
-
-            if kind == FEATURE_CIRCLE:
-                primitive = (x - cx) ** 2 + (y - cy) ** 2 <= p1 ** 2
-            elif kind == FEATURE_RECTANGLE:
-                primitive = _rectangle_mask(
-                    x,
-                    y,
-                    cx,
-                    cy,
-                    p1,
-                    p2,
-                    reflection * angle0 + quarter_turn * np.pi / 2.0,
-                )
-            else:
-                continue
-
-            feature_mask |= primitive
-
-    if operation > 0:
-        mask[feature_mask] = True
-    else:
-        mask[feature_mask] = False
-
-
-def build_mask(
-    genome: Genome,
-    x: np.ndarray,
-    y: np.ndarray,
-    *,
-    l_arm_m: float,
-) -> np.ndarray:
-    ax = np.abs(x)
-    ay = np.abs(y)
-
-    along_x = ax >= ay
-    longitudinal = np.where(along_x, ax, ay)
-    transverse = np.where(along_x, ay, ax)
-    normalized_s = longitudinal / l_arm_m
-
-    inner = _spline_boundary(genome.inner_control_m, normalized_s)
-    outer = _spline_boundary(genome.outer_control_m, normalized_s)
-
-    mask = (longitudinal <= l_arm_m) & (transverse >= inner) & (transverse <= outer)
-
-    radial = np.hypot(x, y)
-    size = float(genome.topology_size_m)
-    width = float(genome.topology_width_m)
-    topology = int(genome.topology)
-
-    if topology == TOPOLOGY_CENTRAL_RF_DISK:
-        mask[radial <= size] = True
-    elif topology == TOPOLOGY_CENTRAL_RF_RING:
-        ring = np.abs(radial - size) <= width / 2.0
-        mask[ring] = True
-    elif topology == TOPOLOGY_CENTRAL_RF_CROSS:
-        cross = (radial <= size) & ((np.abs(x) <= width / 2.0) | (np.abs(y) <= width / 2.0))
-        mask[cross] = True
-    elif topology == TOPOLOGY_GROUNDED_MOAT:
-        moat = np.abs(radial - size) <= width / 2.0
-        mask[moat] = False
-
-    for feature_index in range(genome.feature_kind.shape[0]):
-        _apply_c4v_feature(mask, x, y, genome, feature_index)
-
-    return mask.astype(np.float64, copy=False)
-
-
-def build_masks(
-    genomes: list[Genome],
-    x: np.ndarray,
-    y: np.ndarray,
-    *,
-    l_arm_m: float,
-) -> np.ndarray:
-    return np.stack([build_mask(genome, x, y, l_arm_m=l_arm_m) for genome in genomes], axis=0)
-
 
 def _trace_rf_null(
     bem: Any,
@@ -226,11 +99,41 @@ def _trace_rf_null(
     eps = cfg.trace_step_m
 
     for _ in range(cfg.trace_iterations):
-        field = bem.field_batch(x, y, z, sigma, candidate_chunk=cfg.gpu_candidate_chunk)
-        field_yp = bem.field_batch(x, y + eps, z, sigma, candidate_chunk=cfg.gpu_candidate_chunk)
-        field_ym = bem.field_batch(x, y - eps, z, sigma, candidate_chunk=cfg.gpu_candidate_chunk)
-        field_zp = bem.field_batch(x, y, z + eps, sigma, candidate_chunk=cfg.gpu_candidate_chunk)
-        field_zm = bem.field_batch(x, y, z - eps, sigma, candidate_chunk=cfg.gpu_candidate_chunk)
+        field = bem.field_batch(
+            x,
+            y,
+            z,
+            sigma,
+            candidate_chunk=cfg.gpu_candidate_chunk,
+        )
+        field_yp = bem.field_batch(
+            x,
+            y + eps,
+            z,
+            sigma,
+            candidate_chunk=cfg.gpu_candidate_chunk,
+        )
+        field_ym = bem.field_batch(
+            x,
+            y - eps,
+            z,
+            sigma,
+            candidate_chunk=cfg.gpu_candidate_chunk,
+        )
+        field_zp = bem.field_batch(
+            x,
+            y,
+            z + eps,
+            sigma,
+            candidate_chunk=cfg.gpu_candidate_chunk,
+        )
+        field_zm = bem.field_batch(
+            x,
+            y,
+            z - eps,
+            sigma,
+            candidate_chunk=cfg.gpu_candidate_chunk,
+        )
 
         dEy_dy = (field_yp[:, :, 1] - field_ym[:, :, 1]) / (2.0 * eps)
         dEz_dy = (field_yp[:, :, 2] - field_ym[:, :, 2]) / (2.0 * eps)
@@ -243,16 +146,38 @@ def _trace_rf_null(
         ey = field[:, :, 1]
         ez = field[:, :, 2]
 
-        dy = cp.where(safe, (-ey * dEz_dz + ez * dEy_dz) / determinant, 0.0)
-        dz = cp.where(safe, (-ez * dEy_dy + ey * dEz_dy) / determinant, 0.0)
+        dy = cp.where(
+            safe,
+            (-ey * dEz_dz + ez * dEy_dz) / determinant,
+            0.0,
+        )
+        dz = cp.where(
+            safe,
+            (-ez * dEy_dy + ey * dEz_dy) / determinant,
+            0.0,
+        )
 
-        dy = cp.clip(dy, -cfg.max_newton_step_m, cfg.max_newton_step_m)
-        dz = cp.clip(dz, -cfg.max_newton_step_m, cfg.max_newton_step_m)
+        dy = cp.clip(
+            dy,
+            -cfg.max_newton_step_m,
+            cfg.max_newton_step_m,
+        )
+        dz = cp.clip(
+            dz,
+            -cfg.max_newton_step_m,
+            cfg.max_newton_step_m,
+        )
 
         y = cp.clip(y + dy, -cfg.y_limit_m, cfg.y_limit_m)
         z = cp.clip(z + dz, cfg.z_min_m, cfg.z_max_m)
 
-    field = bem.field_batch(x, y, z, sigma, candidate_chunk=cfg.gpu_candidate_chunk)
+    field = bem.field_batch(
+        x,
+        y,
+        z,
+        sigma,
+        candidate_chunk=cfg.gpu_candidate_chunk,
+    )
     residual = cp.sqrt(field[:, :, 1] ** 2 + field[:, :, 2] ** 2)
     return x, y, z, field, residual
 
@@ -270,15 +195,31 @@ def _curvature_frequencies(
 
     derivatives = []
     for dx, dy, dz in ((eps, 0.0, 0.0), (0.0, eps, 0.0), (0.0, 0.0, eps)):
-        plus = bem.field_batch(x + dx, y + dy, z + dz, sigma, candidate_chunk=cfg.gpu_candidate_chunk)
-        minus = bem.field_batch(x - dx, y - dy, z - dz, sigma, candidate_chunk=cfg.gpu_candidate_chunk)
+        plus = bem.field_batch(
+            x + dx,
+            y + dy,
+            z + dz,
+            sigma,
+            candidate_chunk=cfg.gpu_candidate_chunk,
+        )
+        minus = bem.field_batch(
+            x - dx,
+            y - dy,
+            z - dz,
+            sigma,
+            candidate_chunk=cfg.gpu_candidate_chunk,
+        )
         derivatives.append((plus - minus) / (2.0 * eps))
 
     jacobian = cp.stack(derivatives, axis=3)
     hessian_e2 = 2.0 * cp.matmul(cp.swapaxes(jacobian, 2, 3), jacobian)
     eigenvalues = cp.linalg.eigvalsh(hessian_e2)
 
-    prefactor = CHARGE_CA40_C * cfg.v_rf_peak_v ** 2 / (4.0 * MASS_CA40_KG * OMEGA_RF ** 2)
+    prefactor = (
+        CHARGE_CA40_C
+        * cfg.v_rf_peak_v**2
+        / (4.0 * MASS_CA40_KG * OMEGA_RF**2)
+    )
     return prefactor * cp.sqrt(cp.maximum(eigenvalues, 0.0)) / (2.0 * np.pi)
 
 
@@ -294,11 +235,14 @@ def geometry_penalty(
     outer_curvature = np.diff(genome.outer_control_m, n=2)
 
     curvature_penalty = np.sqrt(
-        np.mean((inner_curvature / 20e-6) ** 2) +
-        np.mean((outer_curvature / 25e-6) ** 2)
+        np.mean((inner_curvature / 20e-6) ** 2)
+        + np.mean((outer_curvature / 25e-6) ** 2)
     )
 
-    return float(np.sum((width_violation / min_rf_width_m) ** 2) + 0.08 * curvature_penalty)
+    return float(
+        np.sum((width_violation / min_rf_width_m) ** 2)
+        + 0.08 * curvature_penalty
+    )
 
 
 class JunctionEvaluator:
@@ -317,7 +261,10 @@ class JunctionEvaluator:
         self.l_arm_m = float(l_arm_m)
         self.config = config or EvaluatorConfig()
 
-    def evaluate_population(self, genomes: list[Genome]) -> list[JunctionEvaluation]:
+    def evaluate_population(
+        self,
+        genomes: list[Genome],
+    ) -> list[JunctionEvaluation]:
         cfg = self.config
         repaired = [genome.clip() for genome in genomes]
 
@@ -325,7 +272,7 @@ class JunctionEvaluator:
             repaired,
             self.x_centers_m,
             self.y_centers_m,
-            l_arm_m=self.l_arm_m,
+            arm_length_m=self.l_arm_m,
         )
 
         sigma = self.bem.solve_masks(masks)
@@ -343,15 +290,36 @@ class JunctionEvaluator:
             candidate_chunk=cfg.gpu_candidate_chunk,
         )
         target_e2 = cp.sum(target_field * target_field, axis=2)
-        pseudo_ev = CHARGE_CA40_C * cfg.v_rf_peak_v ** 2 * target_e2 / (4.0 * MASS_CA40_KG * OMEGA_RF ** 2)
+        pseudo_ev = (
+            CHARGE_CA40_C
+            * cfg.v_rf_peak_v**2
+            * target_e2
+            / (4.0 * MASS_CA40_KG * OMEGA_RF**2)
+        )
 
-        barrier_ev = cp.max(pseudo_ev, axis=1) - cp.min(pseudo_ev[:, -5:], axis=1)
-        frequencies_hz = _curvature_frequencies(self.bem, sigma, x, y, z, cfg)
+        barrier_ev = cp.max(pseudo_ev, axis=1) - cp.min(
+            pseudo_ev[:, -5:],
+            axis=1,
+        )
+        frequencies_hz = _curvature_frequencies(
+            self.bem,
+            sigma,
+            x,
+            y,
+            z,
+            cfg,
+        )
 
         transverse = frequencies_hz[:, :, :2]
         transverse_mean = cp.mean(transverse, axis=2)
-        frequency_error = cp.max(cp.abs(transverse_mean - cfg.target_frequency_hz), axis=1)
-        anisotropy = cp.max(transverse[:, :, 1] / cp.maximum(transverse[:, :, 0], 1.0), axis=1)
+        frequency_error = cp.max(
+            cp.abs(transverse_mean - cfg.target_frequency_hz),
+            axis=1,
+        )
+        anisotropy = cp.max(
+            transverse[:, :, 1] / cp.maximum(transverse[:, :, 0], 1.0),
+            axis=1,
+        )
 
         height_peak = cp.max(cp.abs(z - TARGET_HEIGHT_M), axis=1)
         height_rms = cp.sqrt(cp.mean((z - TARGET_HEIGHT_M) ** 2, axis=1))
@@ -377,26 +345,59 @@ class JunctionEvaluator:
 
         evaluations: list[JunctionEvaluation] = []
         for genome, values in zip(repaired, arrays):
-            peak, rms, lateral, barrier, freq_error, anisotropy_value, residual_value, f_min, f_max = values
+            (
+                peak,
+                rms,
+                lateral,
+                barrier,
+                freq_error,
+                anisotropy_value,
+                residual_value,
+                f_min,
+                f_max,
+            ) = values
 
-            penalty = geometry_penalty(genome, min_rf_width_m=cfg.min_rf_width_m)
-
-            invalid = (
-                (not genome.is_physically_valid(min_rf_width_m=cfg.min_rf_width_m))
-                or (not np.all(np.isfinite(values)))
-                or (peak >= cfg.z_max_m - TARGET_HEIGHT_M - 1e-9)
-                or (residual_value > 5e3)
-                or (f_min < 0.15e6)
+            penalty = geometry_penalty(
+                genome,
+                min_rf_width_m=cfg.min_rf_width_m,
             )
+
+            failure_reasons: list[str] = []
+
+            if not genome.is_physically_valid(min_rf_width_m=cfg.min_rf_width_m):
+                failure_reasons.append("invalid_geometry")
+
+            if not np.all(np.isfinite(values)):
+                failure_reasons.append("non_finite_metrics")
+
+            if peak > cfg.max_height_peak_m:
+                failure_reasons.append("height_peak_above_3um")
+
+            if lateral > cfg.max_lateral_peak_m:
+                failure_reasons.append("lateral_peak_exceeds_limit")
+
+            if residual_value > cfg.max_field_residual_v_m:
+                failure_reasons.append("field_residual_exceeds_limit")
+
+            if f_min < cfg.min_frequency_hz:
+                failure_reasons.append("frequency_below_limit")
+
+            if anisotropy_value > cfg.max_anisotropy:
+                failure_reasons.append("anisotropy_exceeds_limit")
+
+            if peak >= cfg.z_max_m - TARGET_HEIGHT_M - 1e-9:
+                failure_reasons.append("trace_hit_upper_z_bound")
+
+            invalid = len(failure_reasons) > 0
             invalid_penalty = 1000.0 if invalid else 0.0
 
             objectives = np.asarray(
                 [
-                    peak / 3e-6 + invalid_penalty,
+                    peak / cfg.max_height_peak_m + invalid_penalty,
                     lateral / 3e-6 + invalid_penalty,
                     max(barrier, 0.0) / 0.100 + invalid_penalty,
-                    freq_error / 0.5e6,
-                    max(anisotropy_value - 3.0, 0.0),
+                    freq_error / 0.5e6 + invalid_penalty,
+                    max(anisotropy_value - cfg.max_anisotropy, 0.0) + invalid_penalty,
                     penalty + invalid_penalty,
                 ],
                 dtype=np.float64,
@@ -413,7 +414,7 @@ class JunctionEvaluator:
                 "frequency_min_hz": float(f_min),
                 "frequency_max_hz": float(f_max),
                 "geometry_penalty": float(penalty),
-                "invalid": float(bool(invalid)),
+                "invalid": bool(invalid),
             }
 
             evaluations.append(
@@ -422,7 +423,7 @@ class JunctionEvaluator:
                     objectives=objectives,
                     metrics=metrics,
                     valid=not invalid,
-                    failure_reason=None if not invalid else "invalid_geometry_or_trace",
+                    failure_reason=None if not invalid else ";".join(failure_reasons),
                 )
             )
 

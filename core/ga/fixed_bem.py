@@ -1,8 +1,12 @@
 """Fixed-mesh rectangular-panel BEM with automatic CPU/CUDA selection.
 
-CuPy is optional. ``backend='auto'`` uses CUDA when CuPy and a CUDA device are
-available, otherwise it falls back to NumPy/SciPy without importing a CUDA
-module elsewhere in the project.
+The constructor accepts either:
+- rectangular panels with shape (N, 4): x1, x2, y1, y2
+- legacy panel centers with shape (N, 2): xc, yc
+
+If legacy centers are passed, square panels are synthesized automatically using
+`legacy_cell_size_m`. This keeps older mesh builders usable while the solver
+internally operates on true rectangular panels.
 """
 from __future__ import annotations
 
@@ -72,7 +76,6 @@ def _probe_cuda() -> tuple[bool, str, Any | None, Any | None]:
 
 
 def available_backend(requested: BackendName = "auto") -> BackendStatus:
-    """Resolve a requested backend without requiring CuPy for CPU operation."""
     requested = str(requested).lower()
     if requested not in {"auto", "cpu", "cuda"}:
         raise ValueError("backend must be one of: auto, cpu, cuda")
@@ -122,12 +125,45 @@ def available_backend(requested: BackendName = "auto") -> BackendStatus:
     )
 
 
-class FixedMeshBEM:
-    """Dense fixed-mesh BEM operating on NumPy/SciPy or CuPy.
+def _coerce_panels(
+    panels: np.ndarray,
+    *,
+    legacy_cell_size_m: float,
+) -> np.ndarray:
+    values = np.asarray(panels, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError("panels must be a 2D array")
 
-    The dense influence matrix is assembled and factorized once. Electrode
-    masks are then solved as batches of right-hand sides.
-    """
+    if values.shape[1] == 4:
+        rect = values
+    elif values.shape[1] == 2:
+        half = 0.5 * float(legacy_cell_size_m)
+        rect = np.column_stack(
+            [
+                values[:, 0] - half,
+                values[:, 0] + half,
+                values[:, 1] - half,
+                values[:, 1] + half,
+            ]
+        )
+    else:
+        raise ValueError(
+            "panels must have shape (N, 4): x1,x2,y1,y2 "
+            "or legacy centers shape (N, 2): xc,yc"
+        )
+
+    if rect.shape[0] == 0:
+        raise ValueError("panels must not be empty")
+    if np.any(rect[:, 1] <= rect[:, 0]):
+        raise ValueError("each panel must satisfy x2 > x1")
+    if np.any(rect[:, 3] <= rect[:, 2]):
+        raise ValueError("each panel must satisfy y2 > y1")
+
+    return rect
+
+
+class FixedMeshBEM:
+    """Dense fixed-mesh BEM operating on NumPy/SciPy or CuPy."""
 
     def __init__(
         self,
@@ -136,6 +172,7 @@ class FixedMeshBEM:
         backend: BackendName = "auto",
         z_assemble_m: float = 1e-9,
         dtype: str = "float64",
+        legacy_cell_size_m: float = 8e-6,
     ) -> None:
         if dtype not in {"float32", "float64"}:
             raise ValueError("dtype must be 'float32' or 'float64'")
@@ -148,15 +185,10 @@ class FixedMeshBEM:
             )
 
         self.backend_name = self.status.selected
-        self.panels_cpu = np.asarray(panels, dtype=np.float64)
-        if self.panels_cpu.ndim != 2 or self.panels_cpu.shape[1] != 4:
-            raise ValueError("panels must have shape (N, 4): x1,x2,y1,y2")
-        if self.panels_cpu.shape[0] == 0:
-            raise ValueError("panels must not be empty")
-        if np.any(self.panels_cpu[:, 1] <= self.panels_cpu[:, 0]):
-            raise ValueError("each panel must satisfy x2 > x1")
-        if np.any(self.panels_cpu[:, 3] <= self.panels_cpu[:, 2]):
-            raise ValueError("each panel must satisfy y2 > y1")
+        self.panels_cpu = _coerce_panels(
+            panels,
+            legacy_cell_size_m=float(legacy_cell_size_m),
+        )
 
         if self.backend_name == "cuda":
             ok, reason, xp, linear_algebra = _probe_cuda()
@@ -186,8 +218,19 @@ class FixedMeshBEM:
 
     @property
     def cuda_info(self) -> BackendStatus:
-        """Backward-compatible alias used by the original CUDA workflow."""
         return self.status
+
+    @property
+    def x_centers_m(self) -> np.ndarray:
+        return 0.5 * (self.panels_cpu[:, 0] + self.panels_cpu[:, 1])
+
+    @property
+    def y_centers_m(self) -> np.ndarray:
+        return 0.5 * (self.panels_cpu[:, 2] + self.panels_cpu[:, 3])
+
+    @property
+    def panel_centers_m(self) -> np.ndarray:
+        return np.column_stack([self.x_centers_m, self.y_centers_m])
 
     def asnumpy(self, value: Any) -> np.ndarray:
         if self.backend_name == "cuda":
@@ -221,7 +264,6 @@ class FixedMeshBEM:
         )
 
     def assemble(self, *, block_rows: int = 128) -> None:
-        """Assemble the dense influence matrix in bounded row blocks."""
         if block_rows < 1:
             raise ValueError("block_rows must be positive")
         xp = self.xp
@@ -234,7 +276,9 @@ class FixedMeshBEM:
         for start in range(0, self.n, block_rows):
             stop = min(start + block_rows, self.n)
             matrix[start:stop] = KE * self._rect_integral(
-                cx[start:stop, None], cy[start:stop, None], z
+                cx[start:stop, None],
+                cy[start:stop, None],
+                z,
             )
 
         width = p[:, 1] - p[:, 0]
@@ -255,7 +299,6 @@ class FixedMeshBEM:
         )
 
     def solve_masks(self, masks: np.ndarray):
-        """Solve masks shaped ``(batch, N)`` and return backend-native sigma."""
         values = np.asarray(masks, dtype=np.float64)
         if values.ndim == 1:
             values = values[None, :]
@@ -267,7 +310,9 @@ class FixedMeshBEM:
             self.factorize()
         rhs = self.xp.asarray(values.T, dtype=self.dtype)
         sigma = self._linalg.lu_solve(
-            (self.lu, self.piv), rhs, check_finite=False
+            (self.lu, self.piv),
+            rhs,
+            check_finite=False,
         )
         return sigma.T
 
@@ -309,7 +354,6 @@ class FixedMeshBEM:
         return gx, gy, gz
 
     def field_batch(self, x, y, z, sigma, *, candidate_chunk: int = 16):
-        """Evaluate fields and return ``(batch, points, 3)`` backend array."""
         if candidate_chunk < 1:
             raise ValueError("candidate_chunk must be positive")
         xp = self.xp
@@ -317,6 +361,7 @@ class FixedMeshBEM:
         y = xp.asarray(y, dtype=self.dtype)
         z = xp.asarray(z, dtype=self.dtype)
         sigma = xp.asarray(sigma, dtype=self.dtype)
+
         if sigma.ndim == 1:
             sigma = sigma[None, :]
         if x.ndim == 1:
@@ -325,6 +370,7 @@ class FixedMeshBEM:
             y = xp.broadcast_to(y[None, :], x.shape)
         if z.ndim == 1:
             z = xp.broadcast_to(z[None, :], x.shape)
+
         if x.shape != y.shape or x.shape != z.shape:
             raise ValueError("x, y, z must have equal/broadcastable shapes")
         if x.shape[0] != sigma.shape[0]:
@@ -347,7 +393,6 @@ class FixedMeshBEM:
         return xp.concatenate(outputs, axis=0)
 
     def release_matrix(self) -> None:
-        """Release the unfactorized matrix after LU factorization."""
         if self.lu is None:
             raise RuntimeError("factorize before releasing the matrix")
         self.matrix = None
@@ -356,3 +401,11 @@ class FixedMeshBEM:
 
 
 CudaFixedMeshBEM = FixedMeshBEM
+
+__all__ = [
+    "BackendStatus",
+    "BackendName",
+    "FixedMeshBEM",
+    "CudaFixedMeshBEM",
+    "available_backend",
+]
