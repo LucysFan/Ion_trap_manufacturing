@@ -877,26 +877,12 @@ reports/
 If you use this repository in academic work, cite the repository and record the exact commit used for the calculations.
 
 ```text
-LucysFan. Ion Trap Manufacturing:
+RQC Quantum Computing on Cold ions group, Alexey D.:
 Electrostatic modelling, numerical validation, and evolutionary optimisation
 of planar ion-trap electrode geometries.
 GitHub repository: https://github.com/LucysFan/Ion_trap_manufacturing
 ```
 
----
-
-## License
-
-A license file has not yet been added. Before sharing the repository broadly, add a `LICENSE` file and choose terms appropriate for the project.
-
-| Option | When it fits |
-|---|---|
-| MIT | Broad reuse with minimal restrictions |
-| BSD 3-Clause | Permissive academic-friendly reuse |
-| Apache-2.0 | Permissive reuse with explicit patent grant |
-| GPL-3.0 | Derivative software must remain open source |
-
----
 
 <div align="center">
 
