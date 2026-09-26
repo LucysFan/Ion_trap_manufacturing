@@ -877,7 +877,7 @@ reports/
 If you use this repository in academic work, cite the repository and record the exact commit used for the calculations.
 
 ```text
-RQC Quantum Computing on Cold ions group, Alexey D.:
+RQC Quantum Computing on Cold ions group, Alexey Detkovskiy, Artem Podlesniy:
 Electrostatic modelling, numerical validation, and evolutionary optimisation
 of planar ion-trap electrode geometries.
 GitHub repository: https://github.com/LucysFan/Ion_trap_manufacturing
