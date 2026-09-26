@@ -397,7 +397,7 @@ flowchart TD
     classDef genetic fill:#F4EDFF,stroke:#8957E5,stroke-width:2px,color:#25104D;
     classDef physics fill:#FFF4E5,stroke:#EA580C,stroke-width:2px,color:#4A1D00;
     classDef decision fill:#FFF7E6,stroke:#D97706,stroke-width:2px,color:#542A00;
-    classDef end fill:#EAF8EE,stroke:#2EA043,stroke-width:2px,color:#0B3D1B;
+    classDef result fill:#EAF8EE,stroke:#2EA043,stroke-width:2px,color:#0B3D1B;
 
     A[🎲 Create many random<br/>candidate genomes]:::start
     B[🧬 Decode one genome<br/>contours + island choices]:::genetic
