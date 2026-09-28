@@ -969,25 +969,17 @@ def survivors(
     return selected
 
 
-def score(
-    individual: Individual,
-    style: IslandStyle,
-) -> float:
-    if not individual.valid:
+def score(i: Individual, style: IslandStyle) -> float:
+    if not i.valid:
         return np.inf
-
     if style.emphasis == "joint":
-        return max(
-            individual.result["dz_peak_m"] / 10e-6,
-            individual.result["barrier_ev"] / 10e-3,
-        )
-
-    return float(
-        np.dot(
-            np.asarray(style.weights),
-            individual.objectives,
-        )
-    )
+        return max(i.result["dz_peak_m"] / 10e-6, i.result["barrier_ev"] / 10e-3)
+    w = np.asarray(style.weights, dtype=float).ravel()
+    o = np.asarray(i.objectives, dtype=float).ravel()
+    # Если weights короче objectives — используем только barrier (последний компонент).
+    if w.size == 1 and o.size == 2:
+        return float(w[0] * o[-1])
+    return float(np.dot(w, o))
 
 def style_score(
     individual: Individual,
